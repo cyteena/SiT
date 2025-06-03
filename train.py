@@ -139,8 +139,9 @@ def main(args):
 
         entity = os.environ["ENTITY"]
         project = os.environ["PROJECT"]
+        mode = os.environ["WANDB_MODE"]
         if args.wandb:
-            wandb_utils.initialize(args, entity, experiment_name, project)
+            wandb_utils.initialize(args, entity, experiment_name, project,mode)
     else:
         logger = create_logger(None)
 

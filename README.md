@@ -99,15 +99,18 @@ torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-XL/2 --data-path /pa
 **Logging.** To enable `wandb`, firstly set `WANDB_KEY`, `ENTITY`, and `PROJECT` as environment variables:
 
 ```bash
-export WANDB_KEY="key"
-export ENTITY="entity name"
-export PROJECT="project name"
+export WANDB_KEY="3317e96ffed42e6f81ba5dcbb29c17be5d4e7d13"
+export ENTITY="Yitong Chen"
+export PROJECT="SiT"
+export HF_HUB_OFFLINE=1
+export WANDB_MODE="offline"
+export HF_HOME=./data
 ```
 
 Then in training command add the `--wandb` flag:
 
 ```bash
-torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-XL/2 --data-path /path/to/imagenet/train --wandb
+torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-XL/2 --data-path /inspire/hdd/global_public/public_datas/imagenet/ILSVRC/Data/CLS-LOC/train/ --wandb
 ```
 
 **Interpolant settings.** We also support different choices of interpolant and model predictions. For example, to launch SiT-XL/2 (256x256) with `Linear` interpolant and `noise` prediction: 

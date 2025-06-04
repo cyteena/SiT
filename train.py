@@ -236,79 +236,14 @@ def main(args):
         sample_model_kwargs = dict(y=ys)
         model_fn = ema.forward
 
-    if rank == 0: # Log messages only from rank 0 for clarity
-        logger.info(f"Rank {rank}: Starting EMA sample generation (step {train_steps})...")
-    
-    # ema_model is used (via model_fn), which should already be in .eval() mode.
-    # zs is (2 * local_batch_size, C, H_latent, W_latent) if use_cfg=True
-    # Ensure the actual model forward pass is under no_grad and potentially autocast
-    with torch.no_grad():
-        # Step 2 Suggestion: If OOM happens *inside* sample_fn, enable autocast here:
-        # with autocast(enabled=True): # Test this if Step 1 alone isn't enough
-        sample_fn = transport_sampler.sample_ode() # default to ode sampling
-        generated_latents = sample_fn(zs, model_fn, **sample_model_kwargs)[-1] 
-        # generated_latents is on GPU, shape (2 * local_batch_size, 4, H_latent, W_latent)
-
-    # Barrier to ensure all GPUs have generated_latents before proceeding
-    dist.barrier() 
-
-    if use_cfg: # remove null samples part
-        generated_latents, _ = generated_latents.chunk(2, dim=0)
-    # Now, generated_latents is (local_batch_size, 4, H_latent, W_latent) on current GPU
-
-    if rank == 0:
-        logger.info(f"Rank {rank}: Latents moved to CPU for gathering.")
-
-    # Prepare for gathering on rank 0's CPU
-    gathered_latents_list_gpu = None
-    if rank == 0:
-        world_size = dist.get_world_size()
-        # Create a list of tensors on CPU to hold gathered data
-        gathered_latents_list_gpu = [torch.zeros_like(generated_latents) for _ in range(world_size)]
-
-    # Gather all latents from all GPUs' CPU memory to rank 0's CPU memory list
-    dist.gather(generated_latents, gather_list=gathered_latents_list_gpu if rank == 0 else None, dst=0)
-    # del generated_latents_cpu # Delete local CPU copy after gather
-    if  rank == 0:
-        del generated_latents
-
-    if rank == 0:
-        logger.info(f"Rank {rank}: Latents gathered on CPU.")
-        all_gathered_latents_gpu_rank0 = torch.cat(gathered_latents_list_gpu, dim=0)
-        # all_gathered_latents_cpu shape: (global_gbatch_size, 4, H_latent, W_latent)
-        del gathered_latents_list_gpu # Free memory from the list of tensors
-
-        # Perform VAE decoding on rank 0
-        # Move VAE to the correct device (rank 0's GPU) if it's not already there
-        vae.to(device) 
-
-        logger.info(f"Rank {rank}: Decoding {all_gathered_latents_gpu_rank0.shape[0]} samples on GPU...")
-        with torch.no_grad(): # Ensure VAE decode is also no_grad
-            # with autocast(enabled=True): # Optional: VAE decode in mixed precision if it helps
-            decoded_samples_gpu_rank0 = vae.decode(all_gathered_latents_gpu_rank0 / 0.18215).sample
-        # decoded_samples_gpu_rank0 shape: (global_batch_size, 3, image_size, image_size)
-        del all_gathered_latents_gpu_rank0 # Free GPU latents tensor
-
-        if args.wandb:
-            logger.info(f"Rank {rank}: Logging images to wandb...")
-            # Log a CPU tensor to wandb to avoid holding GPU memory during logging sync
-            wandb_utils.log_image(decoded_samples_gpu_rank0.cpu(), train_steps)
-        
-        del decoded_samples_gpu_rank0 # Free GPU image tensor
-        logger.info(f"Rank {rank}: EMA sample generation and logging done.")
-    
-    # Barrier to ensure rank 0 finishes logging and releases memory before other ranks proceed
-    # and to keep all processes in sync.
-    dist.barrier()
-    # torch.cuda.empty_cache() # Optional: call on all ranks if memory fragmentation is suspected.
-                            # Can slow down training slightly. Test if needed.
-
-
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        
         for x, y in loader:
+            ema.to(device)
+            vae.to(device)
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
@@ -361,20 +296,77 @@ def main(args):
                 dist.barrier()
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
-                logger.info("Generating EMA samples...")
-                sample_fn = transport_sampler.sample_ode() # default to ode sampling
-                samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
+
+                if rank == 0: # Log messages only from rank 0 for clarity
+                    logger.info(f"Rank {rank}: Starting EMA sample generation (step {train_steps})...")
+                
+                # ema_model is used (via model_fn), which should already be in .eval() mode.
+                # zs is (2 * local_batch_size, C, H_latent, W_latent) if use_cfg=True
+                # Ensure the actual model forward pass is under no_grad and potentially autocast
+                ema.to(device)
+                ema.eval()
+                with torch.no_grad():
+                    # Step 2 Suggestion: If OOM happens *inside* sample_fn, enable autocast here:
+                    # with autocast(enabled=True): # Test this if Step 1 alone isn't enough
+                    sample_fn = transport_sampler.sample_ode() # default to ode sampling
+                    generated_latents = sample_fn(zs, model_fn, **sample_model_kwargs)[-1] 
+                    # generated_latents is on GPU, shape (2 * local_batch_size, 4, H_latent, W_latent)
+                ema.to('cpu')
+
+                # Barrier to ensure all GPUs have generated_latents before proceeding
+                dist.barrier() 
+
+                if use_cfg: # remove null samples part
+                    generated_latents, _ = generated_latents.chunk(2, dim=0)
+                # Now, generated_latents is (local_batch_size, 4, H_latent, W_latent) on current GPU
+
+                if rank == 0:
+                    logger.info(f"Rank {rank}: Latents moved to CPU for gathering.")
+
+                # Prepare for gathering on rank 0's CPU
+                gathered_latents_list_gpu = None
+                if rank == 0:
+                    world_size = dist.get_world_size()
+                    # Create a list of tensors on CPU to hold gathered data
+                    gathered_latents_list_gpu = [torch.zeros_like(generated_latents) for _ in range(world_size)]
+
+                # Gather all latents from all GPUs' CPU memory to rank 0's CPU memory list
+                dist.gather(generated_latents, gather_list=gathered_latents_list_gpu if rank == 0 else None, dst=0)
+                # del generated_latents_cpu # Delete local CPU copy after gather
+                if  rank == 0:
+                    del generated_latents
+
+                if rank == 0:
+                    logger.info(f"Rank {rank}: Latents gathered on CPU.")
+                    all_gathered_latents_gpu_rank0 = torch.cat(gathered_latents_list_gpu, dim=0)
+                    # all_gathered_latents_cpu shape: (global_gbatch_size, 4, H_latent, W_latent)
+                    del gathered_latents_list_gpu # Free memory from the list of tensors
+
+                    # Perform VAE decoding on rank 0
+                    # Move VAE to the correct device (rank 0's GPU) if it's not already there
+                    vae.to(device) 
+
+                    logger.info(f"Rank {rank}: Decoding {all_gathered_latents_gpu_rank0.shape[0]} samples on GPU...")
+                    with torch.no_grad(): # Ensure VAE decode is also no_grad
+                        # with autocast(enabled=True): # Optional: VAE decode in mixed precision if it helps
+                        decoded_samples_gpu_rank0 = vae.decode(all_gathered_latents_gpu_rank0 / 0.18215).sample
+                    # decoded_samples_gpu_rank0 shape: (global_batch_size, 3, image_size, image_size)
+                    del all_gathered_latents_gpu_rank0 # Free GPU latents tensor
+                    vae.to('cpu')
+
+                    if args.wandb:
+                        logger.info(f"Rank {rank}: Logging images to wandb...")
+                        # Log a CPU tensor to wandb to avoid holding GPU memory during logging sync
+                        wandb_utils.log_image(decoded_samples_gpu_rank0.cpu(), train_steps)
+                    
+                    del decoded_samples_gpu_rank0 # Free GPU image tensor
+                    logger.info(f"Rank {rank}: EMA sample generation and logging done.")
+                
+                # Barrier to ensure rank 0 finishes logging and releases memory before other ranks proceed
+                # and to keep all processes in sync.
                 dist.barrier()
-
-                if use_cfg: #remove null samples
-                    samples, _ = samples.chunk(2, dim=0)
-                samples = vae.decode(samples / 0.18215).sample
-                out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                dist.all_gather_into_tensor(out_samples, samples)
-                if args.wandb:
-                    wandb_utils.log_image(out_samples, train_steps)
-                logging.info("Generating EMA samples done.")
-
+                # torch.cuda.empty_cache() # Optional: call on all ranks if memory fragmentation is suspected.
+                                        # Can slow down training slightly. Test if needed.
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 

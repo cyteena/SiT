@@ -296,6 +296,7 @@ def main(args):
                 dist.barrier()
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
+                vae.to('cpu')
 
                 if rank == 0: # Log messages only from rank 0 for clarity
                     logger.info(f"Rank {rank}: Starting EMA sample generation (step {train_steps})...")
@@ -312,6 +313,7 @@ def main(args):
                     generated_latents = sample_fn(zs, model_fn, **sample_model_kwargs)[-1] 
                     # generated_latents is on GPU, shape (2 * local_batch_size, 4, H_latent, W_latent)
                 ema.to('cpu')
+                torch.cuda.empty_cache()
 
                 # Barrier to ensure all GPUs have generated_latents before proceeding
                 dist.barrier() 
@@ -335,31 +337,41 @@ def main(args):
                 # del generated_latents_cpu # Delete local CPU copy after gather
                 if  rank == 0:
                     del generated_latents
+                    torch.cuda.empty_cache()
 
                 if rank == 0:
                     logger.info(f"Rank {rank}: Latents gathered on CPU.")
                     all_gathered_latents_gpu_rank0 = torch.cat(gathered_latents_list_gpu, dim=0)
                     # all_gathered_latents_cpu shape: (global_gbatch_size, 4, H_latent, W_latent)
                     del gathered_latents_list_gpu # Free memory from the list of tensors
+                    torch.cuda.empty_cache()
 
                     # Perform VAE decoding on rank 0
                     # Move VAE to the correct device (rank 0's GPU) if it's not already there
                     vae.to(device) 
-
+                    
+                    vae_dec_bs = local_batch_size
+                    decoded_sample_list=[]
                     logger.info(f"Rank {rank}: Decoding {all_gathered_latents_gpu_rank0.shape[0]} samples on GPU...")
                     with torch.no_grad(): # Ensure VAE decode is also no_grad
                         # with autocast(enabled=True): # Optional: VAE decode in mixed precision if it helps
-                        decoded_samples_gpu_rank0 = vae.decode(all_gathered_latents_gpu_rank0 / 0.18215).sample
-                    # decoded_samples_gpu_rank0 shape: (global_batch_size, 3, image_size, image_size)
-                    del all_gathered_latents_gpu_rank0 # Free GPU latents tensor
+                        for i in range(0, all_gathered_latents_gpu_rank0.shape[0],vae_dec_bs):
+                            batch_latents = all_gathered_latents_gpu_rank0[i:i+vae_dec_bs]                           
+                            decoded_batch = vae.decode(batch_latents / 0.18215).sample
+                            decoded_sample_list.append(decoded_batch.to('cpu'))
+                            del batch_latents, decoded_batch
+                            torch.cuda.empty_cache()
                     vae.to('cpu')
+                    decoded_sample_all = torch.cat(decoded_sample_list,dim=0)
+                    del decoded_sample_list, all_gathered_latents_gpu_rank0
+                    torch.cuda.empty_cache()
 
                     if args.wandb:
                         logger.info(f"Rank {rank}: Logging images to wandb...")
                         # Log a CPU tensor to wandb to avoid holding GPU memory during logging sync
-                        wandb_utils.log_image(decoded_samples_gpu_rank0.cpu(), train_steps)
+                        wandb_utils.log_image(decoded_sample_all, train_steps)
                     
-                    del decoded_samples_gpu_rank0 # Free GPU image tensor
+                    del decoded_sample_all # Free GPU image tensor
                     logger.info(f"Rank {rank}: EMA sample generation and logging done.")
                 
                 # Barrier to ensure rank 0 finishes logging and releases memory before other ranks proceed
